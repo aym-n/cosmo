@@ -1,9 +1,12 @@
 package raft
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"time"
+
+	pb "github.com/aym-n/cosmo/rpc/proto"
 )
 
 type PersistentState struct {
@@ -39,8 +42,16 @@ type Node struct {
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
 
+	transport Transport
+
 	applyCh chan LogEntry
 	stopCh  chan struct{}
+}
+
+// Transport is the RPC interface used by Node for elections (and later append entries).
+// Implementations are typically in the rpc package.
+type Transport interface {
+	SendRequestVote(peerID NodeID, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
 }
 
 type RequestVoteResponse struct {
@@ -48,13 +59,14 @@ type RequestVoteResponse struct {
 	VoteGranted bool
 }
 
-func NewNode(config Config, applyCh chan LogEntry) *Node {
+func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
 	n := &Node{
-		id:      config.NodeID,
-		config:  config,
-		state:   Follower,
-		applyCh: applyCh,
-		stopCh:  make(chan struct{}),
+		id:        config.NodeID,
+		config:    config,
+		state:     Follower,
+		applyCh:   applyCh,
+		stopCh:    make(chan struct{}),
+		transport: transport,
 		persist: PersistentState{
 			CurrentTerm: 0,
 			VotedFor:    "",
@@ -122,7 +134,7 @@ func (n *Node) resetElectionTimer() {
 	}
 }
 
-func (n *Node) start() {
+func (n *Node) Start() {
 	n.mu.Lock()
 	n.resetElectionTimer()
 	n.mu.Unlock()
@@ -130,7 +142,7 @@ func (n *Node) start() {
 	go n.run()
 }
 
-func (n *Node) stop() {
+func (n *Node) Stop() {
 	close(n.stopCh)
 }
 
@@ -172,14 +184,81 @@ func (n *Node) runFollower() {
 	}
 }
 
-func (n *Node) runCandidate() {}
-func (n *Node) runLeader()    {}
+func (n *Node) runCandidate() {
+	n.mu.Lock()
+
+	term := n.persist.CurrentTerm
+	lastLogIndex := n.lastLogIndex()
+	lastLogTerm := n.lastLogTerm()
+	n.resetElectionTimer()
+
+	n.mu.Unlock()
+
+	voteCh := make(chan bool, len(n.config.Peers))
+	for _, peerID := range n.config.Peers {
+		go func(peer NodeID) {
+			granted := n.sendRequestVote(peer, term, lastLogIndex, lastLogTerm)
+			voteCh <- granted
+		}(peerID)
+	}
+
+	votes := 1
+	majority := len(n.config.Peers)/2 + 1
+
+	votesRecieved := 0
+	for votesRecieved < len(n.config.Peers) {
+		select {
+		case granted := <-voteCh:
+			votesRecieved++
+			if granted {
+				votes++
+			}
+
+			if votes >= majority {
+				n.mu.Lock()
+				if n.state == Candidate && n.persist.CurrentTerm == term {
+					n.becomeLeader()
+				}
+
+				n.mu.Unlock()
+				return
+			}
+
+		case <-n.electionTimer.C:
+			n.mu.Lock()
+			if n.state == Candidate {
+				n.becomeCandidate()
+			}
+			n.mu.Unlock()
+			return
+
+		case <-n.stopCh:
+			return
+
+		}
+	}
+
+	select {
+	case <-n.electionTimer.C:
+
+		n.mu.Lock()
+		if n.state == Candidate {
+			n.becomeCandidate()
+		}
+		n.mu.Unlock()
+
+	case <-n.stopCh:
+		return
+	}
+}
+func (n *Node) runLeader() {}
 
 func (n *Node) becomeCandidate() {
 	n.state = Candidate
 	n.persist.CurrentTerm++
 	n.persist.VotedFor = n.id
 	n.currentLeader = ""
+	n.logInfo("Starting election for term %d", n.persist.CurrentTerm)
 }
 
 func (n *Node) becomeFollower(term Term, leaderID NodeID) {
@@ -189,11 +268,18 @@ func (n *Node) becomeFollower(term Term, leaderID NodeID) {
 	n.currentLeader = leaderID
 	n.leaderState = nil
 	n.resetElectionTimer()
+
+	if leaderID != "" {
+		n.logInfo("Became follower for term %d, leader=%s", term, leaderID) // ADD THIS
+	} else {
+		n.logInfo("Became follower for term %d", term) // ADD THIS
+	}
 }
 
 func (n *Node) becomeLeader() {
 	n.state = Leader
 	n.currentLeader = n.id
+	n.logInfo("Became LEADER for term %d", n.persist.CurrentTerm)
 
 	nextIdx := n.lastLogIndex() + 1
 	leaderState := &LeaderState{
@@ -206,7 +292,6 @@ func (n *Node) becomeLeader() {
 	}
 	n.leaderState = leaderState
 }
-
 
 func (n *Node) HandleRequestVote(term Term, candidateID NodeID, lastLogIndex LogIndex, lastLogTerm Term) RequestVoteResponse {
 	n.mu.Lock()
@@ -239,12 +324,11 @@ func (n *Node) HandleRequestVote(term Term, candidateID NodeID, lastLogIndex Log
 	}
 
 	n.persist.VotedFor = candidateID
-	n.resetElectionTimer() 
+	n.resetElectionTimer()
 	resp.VoteGranted = true
 
 	return resp
 }
-
 
 func (n *Node) isLogUpToDate(lastIndex LogIndex, lastTerm Term) bool {
 	myLastIndex := n.lastLogIndex()
@@ -260,4 +344,35 @@ func (n *Node) isLogUpToDate(lastIndex LogIndex, lastTerm Term) bool {
 
 	// if both are on the same term then the one with more entries is more up to date
 	return lastIndex >= myLastIndex
+}
+
+func (n *Node) sendRequestVote(peerID NodeID, term Term, lastLogIndex LogIndex, lastLogTerm Term) bool {
+	req := &pb.RequestVoteRequest{
+		Term:         uint64(term),
+		CandidateId:  string(n.id),
+		LastLogIndex: uint64(lastLogIndex),
+		LastLogTerm:  uint64(lastLogTerm),
+	}
+
+	resp, err := n.transport.SendRequestVote(peerID, req)
+	if err != nil {
+		// Network error, timeout, or peer is down
+		return false
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// If we see a higher term in the response, step down immediately
+	if Term(resp.Term) > n.persist.CurrentTerm {
+		n.becomeFollower(Term(resp.Term), "")
+		return false
+	}
+
+	return resp.VoteGranted
+}
+
+func (n *Node) logInfo(format string, args ...interface{}) {
+	prefix := "[" + string(n.id) + "] "
+	log.Printf(prefix+format, args...)
 }

@@ -1,4 +1,4 @@
-package raft
+package rpc
 
 import "github.com/aym-n/cosmo/types"
 
@@ -6,4 +6,3 @@ import "github.com/aym-n/cosmo/types"
 type NodeID = types.NodeID
 type Term = types.Term
 type LogIndex = types.LogIndex
-type LogEntry = types.LogEntry
