@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aym-n/cosmo/raft"
 	pb "github.com/aym-n/cosmo/rpc/proto"
 	"github.com/aym-n/cosmo/types"
 	"google.golang.org/grpc"
@@ -62,7 +63,6 @@ func (c *Client) RequestVote(ID types.NodeID, addr string, req *pb.RequestVoteRe
 	return client.RequestVote(ctx, req)
 }
 
-// SendRequestVote implements rpc.Transport for use by raft.Node.
 func (c *Client) SendRequestVote(peerID types.NodeID, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	addr, ok := c.PeerAddresses[peerID]
 	if !ok {
@@ -79,4 +79,23 @@ func (c *Client) Close() {
 		conn.Close()
 	}
 	c.connectionPool = make(map[types.NodeID]*grpc.ClientConn)
+}
+
+func (c *Client) SendAppendEntries(peerID raft.NodeID, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	addr, ok := c.PeerAddresses[peerID]
+	if !ok {
+		return nil, fmt.Errorf("unknown peer address for %v", peerID)
+	}
+	conn, err := c.getConn(peerID, addr)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	pbResp, err := client.AppendEntries(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return pbResp, nil
 }

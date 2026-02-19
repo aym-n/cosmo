@@ -33,14 +33,10 @@ func main() {
 	config := raft.DefaultConfig(raft.NodeID(*nodeID), peers, peerAddrs)
 	applyCh := make(chan raft.LogEntry, 100)
 
-	// Create RPC transport
-	transport := rpc.NewClient(peerAddrs) // CHANGED THIS LINE
-
-	// Create node with transport injected
-	node := raft.NewNode(config, applyCh, transport) // ADDED transport parameter
+	transport := rpc.NewClient(peerAddrs)
+	node := raft.NewNode(config, applyCh, transport)
 	node.Start()
 
-	// Start gRPC server
 	listenAddr := ":" + *port
 	go func() {
 		if err := rpc.StartGRPCServer(node, listenAddr); err != nil {
@@ -50,7 +46,6 @@ func main() {
 
 	log.Printf("Node %s started on port %s", *nodeID, *port)
 
-	// Wait for interrupt
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh

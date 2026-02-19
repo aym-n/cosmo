@@ -46,3 +46,33 @@ func StartGRPCServer(node *raft.Node, listenAddr string) error {
 	log.Printf("gRPC server listening on %s", listenAddr)
 	return grpcServer.Serve(lis)
 }
+
+func (s *Server) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+
+	var entries []raft.LogEntry
+	for _, entry := range req.Entries {
+		entries = append(entries, raft.LogEntry{
+			Index:   raft.LogIndex(entry.Index),
+			Term:    raft.Term(entry.Term),
+			Command: entry.Command,
+		})
+	}
+
+	raftReq := raft.AppendEntriesRequest{
+		Term:         raft.Term(req.Term),
+		LeaderID:     raft.NodeID(req.LeaderId),
+		PrevLogIndex: raft.LogIndex(req.PrevLogIndex),
+		PrevLogTerm:  raft.Term(req.PrevLogTerm),
+		Entries:      entries,
+		LeaderCommit: raft.LogIndex(req.LeaderCommit),
+	}
+
+	resp := s.node.HandleAppendEntries(raftReq)
+
+	return &pb.AppendEntriesResponse{
+		Term:          uint64(resp.Term),
+		Success:       resp.Success,
+		ConflictIndex: uint64(resp.ConflictIndex),
+		ConflictTerm:  uint64(resp.ConflictTerm),
+	}, nil
+}

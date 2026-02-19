@@ -48,15 +48,31 @@ type Node struct {
 	stopCh  chan struct{}
 }
 
-// Transport is the RPC interface used by Node for elections (and later append entries).
-// Implementations are typically in the rpc package.
 type Transport interface {
 	SendRequestVote(peerID NodeID, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
+	SendAppendEntries(peerID NodeID, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
 }
 
 type RequestVoteResponse struct {
 	Term        Term
 	VoteGranted bool
+}
+
+type AppendEntriesRequest struct {
+	Term         Term
+	LeaderID     NodeID
+	PrevLogIndex LogIndex
+	PrevLogTerm  Term
+	Entries      []LogEntry
+	LeaderCommit LogIndex
+}
+
+type AppendEntriesResponse struct {
+	Term    Term
+	Success bool
+
+	ConflictIndex LogIndex
+	ConflictTerm  Term
 }
 
 func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
@@ -251,7 +267,34 @@ func (n *Node) runCandidate() {
 		return
 	}
 }
-func (n *Node) runLeader() {}
+func (n *Node) runLeader() {
+	n.mu.Lock()
+	if n.heartbeatTicker != nil {
+		n.heartbeatTicker.Stop()
+	}
+	n.heartbeatTicker = time.NewTicker(n.config.HeartbeatTimeout)
+	n.mu.Unlock()
+
+	n.sendHeartbeats()
+
+	for {
+		select {
+		case <-n.heartbeatTicker.C:
+			n.sendHeartbeats()
+
+		case <-n.stopCh:
+			return
+		}
+
+		n.mu.Lock()
+		stillLeader := (n.state == Leader)
+		n.mu.Unlock()
+
+		if !stillLeader {
+			return
+		}
+	}
+}
 
 func (n *Node) becomeCandidate() {
 	n.state = Candidate
@@ -330,6 +373,47 @@ func (n *Node) HandleRequestVote(term Term, candidateID NodeID, lastLogIndex Log
 	return resp
 }
 
+func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	resp := AppendEntriesResponse{
+		Term:    n.persist.CurrentTerm,
+		Success: false,
+	}
+
+	// Rule 1: if term < currentTerm , reply flase (leader is stale)
+	if req.Term < n.persist.CurrentTerm {
+		return resp
+	}
+
+	// Rule 2: If we see a higher term, become follower
+	if req.Term > n.persist.CurrentTerm {
+		n.becomeFollower(req.Term, req.LeaderID)
+		resp.Term = n.persist.CurrentTerm
+	}
+
+	// Rule 3: If we are a candidate and see a valid leader, become follower
+	if n.state == Candidate {
+		n.becomeFollower(req.Term, req.LeaderID)
+	}
+
+	n.currentLeader = req.LeaderID
+	n.resetElectionTimer()
+
+	// Heartbeat
+	if len(req.Entries) == 0 {
+		resp.Success = true
+		n.logInfo("Received heartbeat from %s (term=%d)", req.LeaderID, req.Term)
+		return resp
+	}
+
+	// TODO: Handle Log Replication
+
+	resp.Success = true
+	return resp
+}
+
 func (n *Node) isLogUpToDate(lastIndex LogIndex, lastTerm Term) bool {
 	myLastIndex := n.lastLogIndex()
 	myLastTerm := n.lastLogTerm()
@@ -375,4 +459,52 @@ func (n *Node) sendRequestVote(peerID NodeID, term Term, lastLogIndex LogIndex, 
 func (n *Node) logInfo(format string, args ...interface{}) {
 	prefix := "[" + string(n.id) + "] "
 	log.Printf(prefix+format, args...)
+}
+
+func (n *Node) sendHeartbeats() {
+	n.mu.Lock()
+	term := n.persist.CurrentTerm
+	leaderID := n.id
+	commitIndex := n.volatile.CommitIndex
+	n.logInfo("Sending heartbeats to %d peers (term=%d)", len(n.config.Peers), term)
+	n.mu.Unlock()
+
+	for _, peerID := range n.config.Peers {
+		go func(peer NodeID) {
+			n.sendAppendEntries(peer, term, leaderID, commitIndex)
+		}(peerID)
+	}
+}
+
+func (n *Node) sendAppendEntries(peerID NodeID, term Term, leaderID NodeID, commitIndex LogIndex) {
+	n.mu.Lock()
+
+	prevLogIndex := n.lastLogIndex()
+	prevLogTerm := n.lastLogTerm()
+
+	n.mu.Unlock()
+
+	req := &pb.AppendEntriesRequest{
+		Term:         uint64(term),
+		LeaderId:     string(leaderID),
+		PrevLogIndex: uint64(prevLogIndex),
+		PrevLogTerm:  uint64(prevLogTerm),
+		Entries:      nil,
+		LeaderCommit: uint64(commitIndex),
+	}
+
+	resp, err := n.transport.SendAppendEntries(peerID, req)
+	if err != nil {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if Term(resp.Term) > n.persist.CurrentTerm {
+		n.becomeFollower(Term(resp.Term), "")
+		return
+	}
+
+	// TODO: Handle Log Replication
 }
