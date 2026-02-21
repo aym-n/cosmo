@@ -76,3 +76,19 @@ func (s *Server) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest
 		ConflictTerm:  uint64(resp.ConflictTerm),
 	}, nil
 }
+
+func (s *Server) SubmitCommand(ctx context.Context, req *pb.SubmitCommandRequest) (*pb.SubmitCommandResponse, error) {
+	result := s.node.Propose(req.Command)
+	if !result.IsLeader {
+		leaderID, _ := s.node.GetLeader()
+		return &pb.SubmitCommandResponse{
+			Success:  false,
+			LeaderId: string(leaderID),
+		}, nil
+	}
+	return &pb.SubmitCommandResponse{
+		Success: true,
+		Index:   uint64(result.Index),
+		Term:    uint64(result.Term),
+	}, nil
+}

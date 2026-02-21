@@ -75,6 +75,12 @@ type AppendEntriesResponse struct {
 	ConflictTerm  Term
 }
 
+type ProposeResult struct {
+	Index LogIndex
+	Term  Term
+	IsLeader bool
+}
+
 func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
 	n := &Node{
 		id:        config.NodeID,
@@ -401,17 +407,81 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	n.currentLeader = req.LeaderID
 	n.resetElectionTimer()
 
-	// Heartbeat
-	if len(req.Entries) == 0 {
-		resp.Success = true
-		n.logInfo("Received heartbeat from %s (term=%d)", req.LeaderID, req.Term)
-		return resp
+	// Rule 4: Reply false if log does not contain an entry at prevLogIndex whose term matches prevLogTerm 
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex > n.lastLogIndex() {
+			n.logInfo("Log too short: need index %d, have %d", req.PrevLogIndex, n.lastLogIndex())
+			resp.ConflictIndex = n.lastLogIndex() + 1
+			resp.ConflictTerm = 0
+			return resp
+		}
+
+		entry, ok := n.getEntry(req.PrevLogIndex)
+		if !ok || entry.Term != req.PrevLogTerm {
+			n.logInfo("Log mismatch at index %d: expected term %d, have term %d", req.PrevLogIndex, req.PrevLogTerm, entry.Term)
+
+			if ok {
+				resp.ConflictIndex = req.PrevLogIndex
+				resp.ConflictTerm = entry.Term
+
+				for i := req.PrevLogIndex - 1; i >= 1; i-- {
+					if e, exists := n.getEntry(i); exists && e.Term == resp.ConflictTerm {
+						resp.ConflictIndex = i
+					} else {
+						break
+					}
+				}
+			} else {
+				resp.ConflictIndex = n.lastLogIndex() + 1
+				resp.ConflictTerm = 0
+			}
+
+			return resp
+		}
 	}
 
-	// TODO: Handle Log Replication
+	// Rule 5: If an existing entry conflicts with a new one - delete the existing entry and all that follow
+	for _, entry := range req.Entries {
+		index := entry.Index
+		
+		if existingEntry, ok := n.getEntry(index); ok {
+			if existingEntry.Term != entry.Term {
+				// Conflict — truncate log from this point
+				n.logInfo("Truncating log from index %d (term conflict: %d vs %d)", 
+					index, existingEntry.Term, entry.Term)
+				n.truncateFrom(index)
+			} else {
+				// Entry already exists and matches — skip it
+				continue
+			}
+		}
+		
+		// Rule 6: Append any new entries not already in the log
+		n.appendEntry(entry)
+		n.logInfo("Appended entry at index=%d, term=%d", entry.Index, entry.Term)
+	}
+
+	// Rule 7: If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if req.LeaderCommit > n.volatile.CommitIndex {
+		oldCommitIndex := n.volatile.CommitIndex
+		n.volatile.CommitIndex = min(req.LeaderCommit, n.lastLogIndex())
+		n.logInfo("Advanced commitIndex from %d to %d", oldCommitIndex, n.volatile.CommitIndex)
+		
+		// Apply newly committed entries to state machine
+		n.applyCommitted()
+	}
 
 	resp.Success = true
 	return resp
+}
+
+
+func min(a, b LogIndex) LogIndex {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (n *Node) isLogUpToDate(lastIndex LogIndex, lastTerm Term) bool {
@@ -479,17 +549,50 @@ func (n *Node) sendHeartbeats() {
 func (n *Node) sendAppendEntries(peerID NodeID, term Term, leaderID NodeID, commitIndex LogIndex) {
 	n.mu.Lock()
 
-	prevLogIndex := n.lastLogIndex()
-	prevLogTerm := n.lastLogTerm()
+	if n.leaderState == nil {
+		n.mu.Unlock()
+		return
+	}
+	
+	nextIndex := n.leaderState.NextIndex[peerID]
+	prevLogIndex := nextIndex - 1
+
+	var prevLogTerm Term
+	if prevLogIndex == 0 {
+		prevLogTerm = 0 
+	} else if entry, ok := n.getEntry(prevLogIndex); ok {
+		prevLogTerm = entry.Term
+	} else {
+		n.mu.Unlock()
+		return
+	}
 
 	n.mu.Unlock()
 
+	var entries []LogEntry
+	lastLogIndex := n.lastLogIndex()
+	if nextIndex <= lastLogIndex {
+		for idx := nextIndex; idx <= lastLogIndex; idx++ {
+			if entry, ok := n.getEntry(LogIndex(idx)); ok {
+				entries = append(entries, entry)
+			}
+		}
+	}
+
+	pbEntries := make([]*pb.LogEntry, 0, len(entries))
+	for _, e := range entries {
+		pbEntries = append(pbEntries, &pb.LogEntry{
+			Index:   uint64(e.Index),
+			Term:    uint64(e.Term),
+			Command: e.Command,
+		})
+	}
 	req := &pb.AppendEntriesRequest{
 		Term:         uint64(term),
 		LeaderId:     string(leaderID),
 		PrevLogIndex: uint64(prevLogIndex),
 		PrevLogTerm:  uint64(prevLogTerm),
-		Entries:      nil,
+		Entries:      pbEntries,
 		LeaderCommit: uint64(commitIndex),
 	}
 
@@ -506,5 +609,112 @@ func (n *Node) sendAppendEntries(peerID NodeID, term Term, leaderID NodeID, comm
 		return
 	}
 
-	// TODO: Handle Log Replication
+	if n.state != Leader || n.leaderState == nil {
+		return
+	}
+
+	
+	if resp.Success {
+		if len(entries) > 0 {
+			newMatchIndex := entries[len(entries)-1].Index
+			n.leaderState.MatchIndex[peerID] = newMatchIndex
+			n.leaderState.NextIndex[peerID] = newMatchIndex + 1
+			
+			n.logInfo("Replicated up to index=%d on peer %s", newMatchIndex, peerID)
+			
+			n.advanceCommitIndex()
+		}
+	} else {
+
+		if n.leaderState.NextIndex[peerID] > 1 {
+			n.leaderState.NextIndex[peerID]--
+			n.logInfo("Log conflict with %s, decrementing nextIndex to %d", peerID, n.leaderState.NextIndex[peerID])
+		}
+	}
+}
+
+func (n *Node) Propose(command []byte) ProposeResult {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return ProposeResult{
+			IsLeader: false,
+		}
+	}
+
+	index := n.lastLogIndex() + 1
+	entry := LogEntry{
+		Index: index,
+		Term: n.persist.CurrentTerm,
+		Command: command,
+	}
+
+	n.appendEntry(entry)
+	n.logInfo("Proposing command (index=%d, term=%d)", index, n.persist.CurrentTerm)
+
+	// TODO: Persist the entry to disk
+
+	return ProposeResult{
+		Index: index,
+		Term: n.persist.CurrentTerm,
+		IsLeader: true,
+	}
+}
+
+// GetLeader returns the current leader ID and whether this node is the leader.
+// Caller can use leader ID to redirect clients (e.g. via a node-id-to-address map).
+func (n *Node) GetLeader() (leaderID NodeID, isLeader bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.currentLeader, n.state == Leader
+}
+
+func (n *Node) advanceCommitIndex() {
+	if n.state != Leader || n.leaderState == nil {
+		return
+	}
+
+
+	for index := n.volatile.CommitIndex + 1; index <= n.lastLogIndex(); index++ {
+		replicaCount := 1
+		
+		for _, matchIndex := range n.leaderState.MatchIndex {
+			if matchIndex >= index {
+				replicaCount++
+			}
+		}
+		
+		majority := len(n.config.Peers)/2 + 1
+		if replicaCount >= majority {
+			if entry, ok := n.getEntry(index); ok && entry.Term == n.persist.CurrentTerm {
+				oldCommit := n.volatile.CommitIndex
+				n.volatile.CommitIndex = index
+				n.logInfo("Advanced commitIndex from %d to %d (replicated to %d/%d nodes)", 
+					oldCommit, index, replicaCount, len(n.config.Peers)+1)
+				
+				n.applyCommitted()
+			}
+		}
+	}
+}
+
+func (n *Node) applyCommitted() {
+	for n.volatile.LastApplied < n.volatile.CommitIndex {
+		n.volatile.LastApplied++
+		
+		entry, ok := n.getEntry(n.volatile.LastApplied)
+		if !ok {
+			n.logInfo("ERROR: Missing entry at index %d", n.volatile.LastApplied)
+			continue
+		}
+		
+		n.logInfo("Applying entry index=%d, term=%d to state machine", entry.Index, entry.Term)
+		
+		select {
+		case n.applyCh <- entry:
+		default:
+			n.logInfo("WARNING: applyCh full, dropping entry")
+		}
+	}
 }

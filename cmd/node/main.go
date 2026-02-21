@@ -34,9 +34,19 @@ func main() {
 	applyCh := make(chan raft.LogEntry, 100)
 
 	transport := rpc.NewClient(peerAddrs)
+
 	node := raft.NewNode(config, applyCh, transport)
 	node.Start()
 
+	// Consume applied entries
+	go func() {
+		for entry := range applyCh {
+			log.Printf("[%s] STATE MACHINE: Applied index=%d, term=%d, command=%s",
+				*nodeID, entry.Index, entry.Term, string(entry.Command))
+		}
+	}()
+
+	// Start gRPC server
 	listenAddr := ":" + *port
 	go func() {
 		if err := rpc.StartGRPCServer(node, listenAddr); err != nil {
