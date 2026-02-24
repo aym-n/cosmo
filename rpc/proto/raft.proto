@@ -49,8 +49,18 @@ message SubmitCommandResponse {
   string leader_id = 4; 
 }
 
+message GetKeyRequest {
+  string key = 1;
+}
+
+message GetKeyResponse {
+  string value = 1;
+  bool found = 2;
+}
+
 service RaftService {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc SubmitCommand(SubmitCommandRequest) returns (SubmitCommandResponse);
+  rpc GetKey(GetKeyRequest) returns (GetKeyResponse);
 }

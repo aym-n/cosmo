@@ -8,16 +8,18 @@ import (
 
 	"github.com/aym-n/cosmo/raft"
 	pb "github.com/aym-n/cosmo/rpc/proto"
+	"github.com/aym-n/cosmo/statemachine"
 	"google.golang.org/grpc"
 )
 
 type Server struct {
 	pb.UnimplementedRaftServiceServer
 	node *raft.Node
+	kv   *statemachine.KVStore
 }
 
-func NewServer(node *raft.Node) *Server {
-	return &Server{node: node}
+func NewServer(node *raft.Node, kv *statemachine.KVStore) *Server {
+	return &Server{node: node, kv: kv}
 }
 
 func (s *Server) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
@@ -34,14 +36,14 @@ func (s *Server) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*
 	}, nil
 }
 
-func StartGRPCServer(node *raft.Node, listenAddr string) error {
+func StartGRPCServer(node *raft.Node, kv *statemachine.KVStore, listenAddr string) error {
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
 	grpcServer := grpc.NewServer()
-	pb.RegisterRaftServiceServer(grpcServer, NewServer(node))
+	pb.RegisterRaftServiceServer(grpcServer, NewServer(node, kv))
 
 	log.Printf("gRPC server listening on %s", listenAddr)
 	return grpcServer.Serve(lis)
@@ -91,4 +93,12 @@ func (s *Server) SubmitCommand(ctx context.Context, req *pb.SubmitCommandRequest
 		Index:   uint64(result.Index),
 		Term:    uint64(result.Term),
 	}, nil
+}
+
+func (s *Server) GetKey(ctx context.Context, req *pb.GetKeyRequest) (*pb.GetKeyResponse, error) {
+	if s.kv == nil {
+		return &pb.GetKeyResponse{Found: false}, nil
+	}
+	value, found := s.kv.Get(req.Key)
+	return &pb.GetKeyResponse{Value: value, Found: found}, nil
 }

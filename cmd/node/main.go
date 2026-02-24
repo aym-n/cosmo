@@ -9,6 +9,7 @@ import (
 
 	"github.com/aym-n/cosmo/raft"
 	"github.com/aym-n/cosmo/rpc"
+	"github.com/aym-n/cosmo/statemachine"
 )
 
 func main() {
@@ -38,18 +39,23 @@ func main() {
 	node := raft.NewNode(config, applyCh, transport)
 	node.Start()
 
-	// Consume applied entries
+	kv := statemachine.NewKVStore(node)
+
+	// Apply committed entries to KV store
 	go func() {
 		for entry := range applyCh {
-			log.Printf("[%s] STATE MACHINE: Applied index=%d, term=%d, command=%s",
-				*nodeID, entry.Index, entry.Term, string(entry.Command))
+			if err := kv.Apply(entry); err != nil {
+				log.Printf("[%s] KV apply error index=%d: %v", *nodeID, entry.Index, err)
+			} else {
+				log.Printf("[%s] KV applied index=%d, term=%d", *nodeID, entry.Index, entry.Term)
+			}
 		}
 	}()
 
 	// Start gRPC server
 	listenAddr := ":" + *port
 	go func() {
-		if err := rpc.StartGRPCServer(node, listenAddr); err != nil {
+		if err := rpc.StartGRPCServer(node, kv, listenAddr); err != nil {
 			log.Fatalf("gRPC server failed: %v", err)
 		}
 	}()
