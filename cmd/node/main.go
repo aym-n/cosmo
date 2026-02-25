@@ -5,16 +5,19 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/aym-n/cosmo/raft"
 	"github.com/aym-n/cosmo/rpc"
 	"github.com/aym-n/cosmo/statemachine"
+	"github.com/aym-n/cosmo/storage"
 )
 
 func main() {
 	nodeID := flag.String("id", "node1", "Node ID")
 	port := flag.String("port", "50051", "gRPC port")
+	dataDir := flag.String("data", "data", "Data directory for WAL")
 	flag.Parse()
 
 	// Hardcode a 3-node cluster for now
@@ -36,7 +39,17 @@ func main() {
 
 	transport := rpc.NewClient(peerAddrs)
 
-	node := raft.NewNode(config, applyCh, transport)
+	// WAL storage per node
+	store, err := storage.NewStorage(filepath.Join(*dataDir, *nodeID))
+	if err != nil {
+		log.Fatalf("Failed to open storage: %v", err)
+	}
+	defer store.Close()
+
+	node, err := raft.NewNode(config, applyCh, transport, store)
+	if err != nil {
+		log.Fatalf("Failed to create node: %v", err)
+	}
 	node.Start()
 
 	kv := statemachine.NewKVStore(node)
@@ -68,4 +81,5 @@ func main() {
 
 	log.Println("Shutting down...")
 	node.Stop()
+	store.Close()
 }

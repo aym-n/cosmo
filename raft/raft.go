@@ -43,6 +43,7 @@ type Node struct {
 	heartbeatTicker *time.Ticker
 
 	transport Transport
+	store     Persister
 
 	applyCh chan LogEntry
 	stopCh  chan struct{}
@@ -81,7 +82,16 @@ type ProposeResult struct {
 	IsLeader bool
 }
 
-func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
+// Persister persists Raft state and log (e.g. WAL). Pass nil for no persistence.
+type Persister interface {
+	SaveMetadata(term Term, votedFor NodeID) error
+	LoadMetadata() (term Term, votedFor NodeID, err error)
+	AppendLogEntry(entry LogEntry) error
+	LoadLog() ([]LogEntry, error)
+	TruncateLog(fromIndex LogIndex) error
+}
+
+func NewNode(config Config, applyCh chan LogEntry, transport Transport, store Persister) (*Node, error) {
 	n := &Node{
 		id:        config.NodeID,
 		config:    config,
@@ -89,6 +99,7 @@ func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
 		applyCh:   applyCh,
 		stopCh:    make(chan struct{}),
 		transport: transport,
+		store:     store,
 		persist: PersistentState{
 			CurrentTerm: 0,
 			VotedFor:    "",
@@ -99,7 +110,18 @@ func NewNode(config Config, applyCh chan LogEntry, transport Transport) *Node {
 			LastApplied: 0,
 		},
 	}
-	return n
+	if store != nil {
+		term, votedFor, err := store.LoadMetadata()
+		if err == nil {
+			n.persist.CurrentTerm = term
+			n.persist.VotedFor = votedFor
+		}
+		entries, err := store.LoadLog()
+		if err == nil && len(entries) > 0 {
+			n.persist.Log = entries
+		}
+	}
+	return n, nil
 }
 
 func (n *Node) lastLogIndex() LogIndex {
@@ -125,11 +147,23 @@ func (n *Node) getEntry(index LogIndex) (LogEntry, bool) {
 
 func (n *Node) appendEntry(entry LogEntry) {
 	n.persist.Log = append(n.persist.Log, entry)
+	if n.store != nil {
+		_ = n.store.AppendLogEntry(entry)
+	}
 }
 
 func (n *Node) truncateFrom(index LogIndex) {
 	if int(index) <= len(n.persist.Log) {
 		n.persist.Log = n.persist.Log[:index-1]
+		if n.store != nil {
+			_ = n.store.TruncateLog(index)
+		}
+	}
+}
+
+func (n *Node) persistMetadata() {
+	if n.store != nil {
+		_ = n.store.SaveMetadata(n.persist.CurrentTerm, n.persist.VotedFor)
 	}
 }
 
@@ -307,6 +341,7 @@ func (n *Node) becomeCandidate() {
 	n.persist.CurrentTerm++
 	n.persist.VotedFor = n.id
 	n.currentLeader = ""
+	n.persistMetadata()
 	n.logInfo("Starting election for term %d", n.persist.CurrentTerm)
 }
 
@@ -314,6 +349,7 @@ func (n *Node) becomeFollower(term Term, leaderID NodeID) {
 	n.state = Follower
 	n.persist.CurrentTerm = term
 	n.persist.VotedFor = ""
+	n.persistMetadata()
 	n.currentLeader = leaderID
 	n.leaderState = nil
 	n.resetElectionTimer()
@@ -373,6 +409,7 @@ func (n *Node) HandleRequestVote(term Term, candidateID NodeID, lastLogIndex Log
 	}
 
 	n.persist.VotedFor = candidateID
+	n.persistMetadata()
 	n.resetElectionTimer()
 	resp.VoteGranted = true
 
