@@ -9,4 +9,8 @@ type Persister interface {
 	AppendLogEntry(entry types.LogEntry) error
 	LoadLog() ([]types.LogEntry, error)
 	TruncateLog(fromIndex types.LogIndex) error
+
+	SaveSnapshot(snapshotData []byte, lastIncludedIndex types.LogIndex, lastIncludedTerm types.Term) error
+	LoadSnapshot() (snapshotData []byte, lastIncludedIndex types.LogIndex, lastIncludedTerm types.Term, err error)
+	CompactLog(lastIncludedIndex types.LogIndex) error
 }

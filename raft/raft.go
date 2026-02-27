@@ -46,6 +46,10 @@ type Node struct {
 	transport Transport
 	store     consensus.Persister
 
+	firstLogIndex LogIndex
+	snapshotLastTerm Term
+	snapshotFunc func(lastApplied LogIndex, lastTerm Term) ([]byte, error)
+
 	applyCh chan LogEntry
 	stopCh  chan struct{}
 }
@@ -79,13 +83,14 @@ type AppendEntriesResponse struct {
 
 func NewNode(config Config, applyCh chan LogEntry, transport Transport, store consensus.Persister) (*Node, error) {
 	n := &Node{
-		id:        config.NodeID,
-		config:    config,
-		state:     Follower,
-		applyCh:   applyCh,
-		stopCh:    make(chan struct{}),
-		transport: transport,
-		store:     store,
+		id:            config.NodeID,
+		config:        config,
+		state:         Follower,
+		applyCh:       applyCh,
+		stopCh:        make(chan struct{}),
+		transport:     transport,
+		store:         store,
+		firstLogIndex: 1,
 		persist: PersistentState{
 			CurrentTerm: 0,
 			VotedFor:    "",
@@ -102,9 +107,24 @@ func NewNode(config Config, applyCh chan LogEntry, transport Transport, store co
 			n.persist.CurrentTerm = term
 			n.persist.VotedFor = votedFor
 		}
-		entries, err := store.LoadLog()
-		if err == nil && len(entries) > 0 {
-			n.persist.Log = entries
+		snapData, lastIdx, lastTerm, err := store.LoadSnapshot()
+		if err == nil && len(snapData) > 0 && lastIdx > 0 {
+			n.firstLogIndex = lastIdx + 1
+			n.snapshotLastTerm = Term(lastTerm)
+			n.volatile.LastApplied = lastIdx
+			entries, err := store.LoadLog()
+			if err == nil {
+				for _, e := range entries {
+					if e.Index > lastIdx {
+						n.persist.Log = append(n.persist.Log, e)
+					}
+				}
+			}
+		} else {
+			entries, err := store.LoadLog()
+			if err == nil && len(entries) > 0 {
+				n.persist.Log = entries
+			}
 		}
 	}
 	return n, nil
@@ -112,9 +132,9 @@ func NewNode(config Config, applyCh chan LogEntry, transport Transport, store co
 
 func (n *Node) lastLogIndex() LogIndex {
 	if len(n.persist.Log) == 0 {
-		return 0
+		return n.firstLogIndex - 1
 	}
-	return n.persist.Log[len(n.persist.Log)-1].Index
+	return n.firstLogIndex + LogIndex(len(n.persist.Log)) - 1
 }
 
 func (n *Node) lastLogTerm() Term {
@@ -125,10 +145,20 @@ func (n *Node) lastLogTerm() Term {
 }
 
 func (n *Node) getEntry(index LogIndex) (LogEntry, bool) {
-	if index == 0 || int(index) > len(n.persist.Log) {
+	if index < n.firstLogIndex {
 		return LogEntry{}, false
 	}
-	return n.persist.Log[index-1], true
+	offset := index - n.firstLogIndex
+	if offset >= LogIndex(len(n.persist.Log)) {
+		return LogEntry{}, false
+	}
+	return n.persist.Log[offset], true
+}
+
+func (n *Node) SetSnapshotFunc(fn func(lastApplied LogIndex, lastTerm Term) ([]byte, error)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.snapshotFunc = fn
 }
 
 func (n *Node) appendEntry(entry LogEntry) {
@@ -139,8 +169,12 @@ func (n *Node) appendEntry(entry LogEntry) {
 }
 
 func (n *Node) truncateFrom(index LogIndex) {
-	if int(index) <= len(n.persist.Log) {
-		n.persist.Log = n.persist.Log[:index-1]
+	if index <= n.firstLogIndex {
+		return
+	}
+	keepLen := index - n.firstLogIndex
+	if keepLen < LogIndex(len(n.persist.Log)) {
+		n.persist.Log = n.persist.Log[:keepLen]
 		if n.store != nil {
 			_ = n.store.TruncateLog(index)
 		}
@@ -447,7 +481,7 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 				resp.ConflictIndex = req.PrevLogIndex
 				resp.ConflictTerm = entry.Term
 
-				for i := req.PrevLogIndex - 1; i >= 1; i-- {
+				for i := req.PrevLogIndex - 1; i >= n.firstLogIndex; i-- {
 					if e, exists := n.getEntry(i); exists && e.Term == resp.ConflictTerm {
 						resp.ConflictIndex = i
 					} else {
@@ -582,9 +616,11 @@ func (n *Node) sendAppendEntries(peerID NodeID, term Term, leaderID NodeID, comm
 
 	var prevLogTerm Term
 	if prevLogIndex == 0 {
-		prevLogTerm = 0 
+		prevLogTerm = 0
 	} else if entry, ok := n.getEntry(prevLogIndex); ok {
 		prevLogTerm = entry.Term
+	} else if prevLogIndex == n.firstLogIndex-1 {
+		prevLogTerm = n.snapshotLastTerm
 	} else {
 		n.mu.Unlock()
 		return
@@ -724,19 +760,48 @@ func (n *Node) advanceCommitIndex() {
 func (n *Node) applyCommitted() {
 	for n.volatile.LastApplied < n.volatile.CommitIndex {
 		n.volatile.LastApplied++
-		
+
 		entry, ok := n.getEntry(n.volatile.LastApplied)
 		if !ok {
 			n.logInfo("ERROR: Missing entry at index %d", n.volatile.LastApplied)
 			continue
 		}
-		
+
 		n.logInfo("Applying entry index=%d, term=%d to state machine", entry.Index, entry.Term)
-		
+
 		select {
 		case n.applyCh <- entry:
 		default:
 			n.logInfo("WARNING: applyCh full, dropping entry")
 		}
+	}
+
+	if n.snapshotFunc != nil && n.store != nil && n.volatile.LastApplied > 0 &&
+		n.volatile.LastApplied % n.config.SnapshotInterval == 0 {	
+		lastEntry, _ := n.getEntry(n.volatile.LastApplied)
+		data, err := n.snapshotFunc(n.volatile.LastApplied, lastEntry.Term)
+		if err != nil {
+			n.logInfo("Snapshot callback error: %v", err)
+			return
+		}
+		if err := n.store.SaveSnapshot(data, n.volatile.LastApplied, lastEntry.Term); err != nil {
+			n.logInfo("SaveSnapshot error: %v", err)
+			return
+		}
+		if err := n.store.CompactLog(n.volatile.LastApplied); err != nil {
+			n.logInfo("CompactLog error: %v", err)
+			return
+		}
+		
+		newLog := make([]LogEntry, 0, len(n.persist.Log))
+		for _, e := range n.persist.Log {
+			if e.Index > n.volatile.LastApplied {
+				newLog = append(newLog, e)
+			}
+		}
+		n.persist.Log = newLog
+		n.firstLogIndex = n.volatile.LastApplied + 1
+		n.snapshotLastTerm = lastEntry.Term
+		n.logInfo("Snapshot at index=%d, compacted log (firstLogIndex=%d)", n.volatile.LastApplied, n.firstLogIndex)
 	}
 }

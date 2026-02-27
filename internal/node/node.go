@@ -34,10 +34,22 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
+
+	kv := statemachine.NewKVStore(raftNode)
+	if snapData, _, _, err := store.LoadSnapshot(); err == nil && len(snapData) > 0 {
+		if err := kv.RestoreSnapshot(snapData); err != nil {
+			log.Printf("[%s] RestoreSnapshot warning: %v", config.NodeID, err)
+		} else {
+			log.Printf("[%s] Restored KV from snapshot", config.NodeID)
+		}
+	}
+	raftNode.SetSnapshotFunc(func(lastApplied raft.LogIndex, _ raft.Term) ([]byte, error) {
+		return kv.SnapshotBytes()
+	})
+
 	raftNode.Start()
 	defer raftNode.Stop()
 
-	kv := statemachine.NewKVStore(raftNode)
 	go applyLoop(config.NodeID, applyCh, kv)
 
 	listenAddr := ":" + config.Port

@@ -1,6 +1,7 @@
 package statemachine
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -97,4 +98,21 @@ func (kv *KVStore) Size() int {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	return len(kv.data)
+}
+
+func (kv *KVStore) SnapshotBytes() ([]byte, error) {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	return json.Marshal(kv.data)
+}
+
+func (kv *KVStore) RestoreSnapshot(data []byte) error {
+	var dataMap map[string]string
+	if err := json.Unmarshal(data, &dataMap); err != nil {
+		return fmt.Errorf("restore snapshot: %w", err)
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.data = dataMap
+	return nil
 }

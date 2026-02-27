@@ -11,6 +11,8 @@ type Config struct {
 	HeartbeatTimeout time.Duration
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
+
+	SnapshotInterval int
 }
 
 func DefaultConfig(id NodeID, peers []NodeID, addresses map[NodeID]string) Config {
@@ -21,5 +23,7 @@ func DefaultConfig(id NodeID, peers []NodeID, addresses map[NodeID]string) Confi
 		HeartbeatTimeout: 50 * time.Millisecond,
 		ElectionTimeoutMin: 150 * time.Millisecond,
 		ElectionTimeoutMax: 300 * time.Millisecond,
+
+		SnapshotInterval: 5,
 	}
 }
