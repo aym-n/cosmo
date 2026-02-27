@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/aym-n/cosmo/statemachine"
+	"github.com/aym-n/cosmo/api"
 	pb "github.com/aym-n/cosmo/rpc/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -78,8 +78,7 @@ func main() {
 				continue
 			}
 			key, value := parts[1], strings.Join(parts[2:], " ")
-			cmd := statemachine.NewPutCommand(key, value)
-			encoded, err := cmd.Encode()
+			encoded, err := api.EncodePut(key, value)
 			if err != nil {
 				log.Printf("Encode error: %v", err)
 				continue
@@ -104,8 +103,7 @@ func main() {
 				fmt.Println("Usage: DELETE <key>")
 				continue
 			}
-			cmd := statemachine.NewDeleteCommand(parts[1])
-			encoded, err := cmd.Encode()
+			encoded, err := api.EncodeDelete(parts[1])
 			if err != nil {
 				log.Printf("Encode error: %v", err)
 				continue

@@ -4,19 +4,20 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/aym-n/cosmo/raft"
+	"github.com/aym-n/cosmo/internal/consensus"
+	"github.com/aym-n/cosmo/types"
 )
 
 type KVStore struct {
-	mu    sync.RWMutex
-	data  map[string]string 
-	raft  *raft.Node   
+	mu       sync.RWMutex
+	data     map[string]string
+	proposer consensus.Proposer
 }
 
-func NewKVStore(raftNode *raft.Node) *KVStore {
+func NewKVStore(proposer consensus.Proposer) *KVStore {
 	return &KVStore{
-		data: make(map[string]string),
-		raft: raftNode,
+		data:     make(map[string]string),
+		proposer: proposer,
 	}
 }
 
@@ -28,14 +29,14 @@ func (kv *KVStore) Get(key string) (string, bool) {
 	return value, exists
 }
 
-func (kv *KVStore) Put(key, value string) (raft.LogIndex, error) {
+func (kv *KVStore) Put(key, value string) (types.LogIndex, error) {
 	cmd := NewPutCommand(key, value)
 	encoded, err := cmd.Encode()
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode command: %w", err)
 	}
 
-	result := kv.raft.Propose(encoded)
+	result := kv.proposer.Propose(encoded)
 	if !result.IsLeader {
 		return 0, fmt.Errorf("not the leader")
 	}
@@ -43,14 +44,14 @@ func (kv *KVStore) Put(key, value string) (raft.LogIndex, error) {
 	return result.Index, nil
 }
 
-func (kv *KVStore) Delete(key string) (raft.LogIndex, error) {
+func (kv *KVStore) Delete(key string) (types.LogIndex, error) {
 	cmd := NewDeleteCommand(key)
 	encoded, err := cmd.Encode()
 	if err != nil {
 		return 0, fmt.Errorf("failed to encode command: %w", err)
 	}
 
-	result := kv.raft.Propose(encoded)
+	result := kv.proposer.Propose(encoded)
 	if !result.IsLeader {
 		return 0, fmt.Errorf("not the leader")
 	}
@@ -58,7 +59,7 @@ func (kv *KVStore) Delete(key string) (raft.LogIndex, error) {
 	return result.Index, nil
 }
 
-func (kv *KVStore) Apply(entry raft.LogEntry) error {
+func (kv *KVStore) Apply(entry types.LogEntry) error {
 	cmd, err := DecodeCommand(entry.Command)
 	if err != nil {
 		return fmt.Errorf("failed to decode command: %w", err)

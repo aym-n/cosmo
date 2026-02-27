@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/aym-n/cosmo/raft"
+	"github.com/aym-n/cosmo/types"
 )
 
 type Storage struct {
@@ -19,8 +19,8 @@ type Storage struct {
 }
 
 type metadata struct {
-	CurrentTerm raft.Term   `json:"current_term"`
-	VotedFor    raft.NodeID `json:"voted_for"`
+	CurrentTerm types.Term   `json:"current_term"`
+	VotedFor    types.NodeID `json:"voted_for"`
 }
 
 func NewStorage(directory string) (*Storage, error) {
@@ -48,7 +48,7 @@ func NewStorage(directory string) (*Storage, error) {
 	return s, nil
 }
 
-func (s *Storage) SaveMetadata(term raft.Term, votedFor raft.NodeID) error {
+func (s *Storage) SaveMetadata(term types.Term, votedFor types.NodeID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -69,7 +69,7 @@ func (s *Storage) SaveMetadata(term raft.Term, votedFor raft.NodeID) error {
 	return nil
 }
 
-func (s *Storage) LoadMetadata() (raft.Term, raft.NodeID, error) {
+func (s *Storage) LoadMetadata() (types.Term, types.NodeID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -88,7 +88,7 @@ func (s *Storage) LoadMetadata() (raft.Term, raft.NodeID, error) {
 	return meta.CurrentTerm, meta.VotedFor, nil
 }
 
-func (s *Storage) AppendLogEntry(entry raft.LogEntry) error {
+func (s *Storage) AppendLogEntry(entry types.LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -104,7 +104,7 @@ func (s *Storage) AppendLogEntry(entry raft.LogEntry) error {
 	return nil
 }
 
-func (s *Storage) LoadLog() ([]raft.LogEntry, error) {
+func (s *Storage) LoadLog() ([]types.LogEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -112,11 +112,11 @@ func (s *Storage) LoadLog() ([]raft.LogEntry, error) {
 		return nil, fmt.Errorf("seek failed: %w", err)
 	}
 
-	var entries []raft.LogEntry
+	var entries []types.LogEntry
 	decoder := json.NewDecoder(s.logFile)
 
 	for {
-		var entry raft.LogEntry
+		var entry types.LogEntry
 		err := decoder.Decode(&entry)
 		if err == io.EOF {
 			break
@@ -130,7 +130,7 @@ func (s *Storage) LoadLog() ([]raft.LogEntry, error) {
 	return entries, nil
 }
 
-func (s *Storage) TruncateLog(fromIndex raft.LogIndex) error {
+func (s *Storage) TruncateLog(fromIndex types.LogIndex) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -138,10 +138,10 @@ func (s *Storage) TruncateLog(fromIndex raft.LogIndex) error {
 		return fmt.Errorf("seek failed: %w", err)
 	}
 
-	var entries []raft.LogEntry
+	var entries []types.LogEntry
 	decoder := json.NewDecoder(s.logFile)
 	for {
-		var entry raft.LogEntry
+		var entry types.LogEntry
 		err := decoder.Decode(&entry)
 		if err == io.EOF {
 			break

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aym-n/cosmo/internal/consensus"
 	pb "github.com/aym-n/cosmo/rpc/proto"
 )
 
@@ -43,7 +44,7 @@ type Node struct {
 	heartbeatTicker *time.Ticker
 
 	transport Transport
-	store     Persister
+	store     consensus.Persister
 
 	applyCh chan LogEntry
 	stopCh  chan struct{}
@@ -76,22 +77,7 @@ type AppendEntriesResponse struct {
 	ConflictTerm  Term
 }
 
-type ProposeResult struct {
-	Index LogIndex
-	Term  Term
-	IsLeader bool
-}
-
-// Persister persists Raft state and log (e.g. WAL). Pass nil for no persistence.
-type Persister interface {
-	SaveMetadata(term Term, votedFor NodeID) error
-	LoadMetadata() (term Term, votedFor NodeID, err error)
-	AppendLogEntry(entry LogEntry) error
-	LoadLog() ([]LogEntry, error)
-	TruncateLog(fromIndex LogIndex) error
-}
-
-func NewNode(config Config, applyCh chan LogEntry, transport Transport, store Persister) (*Node, error) {
+func NewNode(config Config, applyCh chan LogEntry, transport Transport, store consensus.Persister) (*Node, error) {
 	n := &Node{
 		id:        config.NodeID,
 		config:    config,
@@ -670,31 +656,30 @@ func (n *Node) sendAppendEntries(peerID NodeID, term Term, leaderID NodeID, comm
 	}
 }
 
-func (n *Node) Propose(command []byte) ProposeResult {
+// Propose implements consensus.Proposer.
+func (n *Node) Propose(command []byte) consensus.ProposeResult {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	if n.state != Leader {
-		return ProposeResult{
+		return consensus.ProposeResult{
 			IsLeader: false,
 		}
 	}
 
 	index := n.lastLogIndex() + 1
 	entry := LogEntry{
-		Index: index,
-		Term: n.persist.CurrentTerm,
+		Index:   index,
+		Term:    n.persist.CurrentTerm,
 		Command: command,
 	}
 
 	n.appendEntry(entry)
 	n.logInfo("Proposing command (index=%d, term=%d)", index, n.persist.CurrentTerm)
 
-	// TODO: Persist the entry to disk
-
-	return ProposeResult{
-		Index: index,
-		Term: n.persist.CurrentTerm,
+	return consensus.ProposeResult{
+		Index:    index,
+		Term:     n.persist.CurrentTerm,
 		IsLeader: true,
 	}
 }
